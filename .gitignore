@@ -1,0 +1,31 @@
+# Зависимости
+go.sum
+
+# Переменные окружения (секреты!)
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Бинарники
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Временные файлы
+tmp/
+temp/
+*.tmp
+
+# Системные
+.DS_Store
+Thumbs.db
+
+# Логи
+*.log
