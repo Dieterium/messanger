@@ -6,7 +6,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/labstack/echo/v4"
@@ -33,6 +35,17 @@ type SignUpReq struct {
 	Public_key string `json:"public_key"`
 }
 
+type SignInReq struct {
+	Name     string `json:"name"`
+	Password string `json:"password"`
+}
+
+type SignInResp struct {
+	Status  string `json:"status"`
+	Message string `json:"message"`
+	Token   string `json:"token,omitempty"`
+}
+
 type Response struct {
 	Status  string `json:"status"`
 	Message string `json:"message"`
@@ -44,6 +57,45 @@ func hashPassword(password string) (string, error) {
 		return "", err
 	}
 	return string(hash), nil
+}
+
+func generateToken(userID int, username string) (string, error) {
+	claims := jwt.MapClaims{
+		"user_id": userID,
+		"name":    username,
+		"exp":     time.Now().Add(time.Hour * 24).Unix(),
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	secret_key := os.Getenv("JWT_SECRET")
+	if secret_key == "" {
+		secret_key = "defoultKey"
+	}
+
+	return token.SignedString([]byte(secret_key))
+}
+
+func checkToken(TokenS string) (int, string, error) {
+	secret := os.Getenv("JWT_SECRET")
+
+	if secret == "" {
+		secret = "defoultKey"
+	}
+
+	token, err := jwt.Parse(TokenS, func(t *jwt.Token) (interface{}, error) {
+		return []byte(secret), nil
+	})
+
+	if err != nil {
+		return 0, "", err
+	}
+
+	claims := token.Claims.(jwt.MapClaims)
+	userID := int(claims["user_id"].(float64))
+	username := claims["name"].(string)
+
+	return userID, username, nil
 }
 
 func LoadDB() *pgxpool.Pool {
@@ -141,6 +193,70 @@ func PostHandleSignUp(c echo.Context) error {
 	})
 }
 
+func PostHandleSignIn(c echo.Context) error {
+	var req SignInReq
+
+	if err := c.Bind(&req); err != nil {
+		c.JSON(http.StatusBadRequest, Response{
+			Status:  "Error",
+			Message: "Uncorect form request",
+		})
+	}
+
+	if req.Name == "" || req.Password == "" {
+		c.JSON(http.StatusBadRequest, Response{
+			Status:  "Error",
+			Message: "Username and password are required",
+		})
+	}
+
+	pool := LoadDB()
+	defer pool.Close()
+
+	query := `SELECT id, "Name", "Password" FROM users WHERE "Name" = $1`
+
+	var userID int
+	var name string
+	var hashedPassword string
+
+	errr := pool.QueryRow(
+		context.Background(),
+		query,
+		req.Name,
+	).Scan(&userID, &name, &hashedPassword)
+
+	if errr != nil {
+		log.Println("User not found:", errr)
+		return c.JSON(http.StatusUnauthorized, Response{
+			Status:  "Error",
+			Message: "Invalid username or password",
+		})
+	}
+
+	err := bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(req.Password))
+	if err != nil {
+		log.Println("Password mismatch:", err)
+		return c.JSON(http.StatusUnauthorized, Response{
+			Status:  "Error",
+			Message: "Invalid username or password",
+		})
+	}
+
+	token, err := generateToken(userID, name)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, Response{
+			Status:  "Error",
+			Message: "Failed to generate token",
+		})
+	}
+
+	return c.JSON(http.StatusOK, SignInResp{
+		Status:  "Success",
+		Message: "Login soccessful",
+		Token:   token,
+	})
+}
+
 func main() {
 	pool := LoadDB()
 	if pool == nil {
@@ -151,6 +267,7 @@ func main() {
 	e := echo.New()
 
 	e.POST("/sign_up", PostHandleSignUp)
+	e.POST("/sign_in", PostHandleSignIn)
 
 	e.GET("/", func(c echo.Context) error {
 		return c.String(http.StatusOK, "Messenger API is running!")
