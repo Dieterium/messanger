@@ -313,7 +313,7 @@ func SendMessage(c echo.Context) error {
 		})
 	}
 
-	query1 := `INSERT INTO "messages" ("Text", "author", "id_user") VALUES ($1, $2, $3) RETURNING id`
+	query1 := `INSERT INTO "messages" ("Text", "author", "id_user", "to_user_id", "to_name") VALUES ($1, $2, $3, $4, $5) RETURNING id`
 
 	var MessageID int
 	err1 := pool.QueryRow(
@@ -322,6 +322,8 @@ func SendMessage(c echo.Context) error {
 		req.Text,
 		username,
 		userID,
+		req.ToUserID,
+		TouserName,
 	).Scan(&MessageID)
 
 	if err1 != nil {
@@ -338,6 +340,67 @@ func SendMessage(c echo.Context) error {
 	})
 }
 
+func GetMessages(c echo.Context) error {
+	authHeader := c.Request().Header.Get("Authorization")
+
+	if authHeader == "" {
+		return c.JSON(http.StatusUnauthorized, Response{
+			Status:  "Error",
+			Message: "Missing auth token",
+		})
+	}
+
+	TokenS := authHeader[7:]
+
+	userID, _, err := checkToken(TokenS)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, Response{
+			Status:  "Error",
+			Message: "Invalid token",
+		})
+	}
+
+	pool := LoadDB()
+	defer pool.Close()
+
+	query := `SELECT id, "Text", author, to_name, created_at FROM messages WHERE id_user=$1 OR to_user_id=$1 ORDER BY created_at ASC`
+
+	rows, err := pool.Query(context.Background(), query, userID)
+
+	if err != nil {
+		log.Println("Error fetching messages:", err)
+		return c.JSON(http.StatusInternalServerError, Response{
+			Status:  "Error",
+			Message: "Failed to fetch messages",
+		})
+	}
+
+	defer rows.Close()
+
+	var messages []MessageResp
+	for rows.Next() {
+		var msg MessageResp
+		var createdAt time.Time
+
+		err := rows.Scan(
+			&msg.ID,
+			&msg.Text,
+			&msg.From,
+			&msg.To,
+			&createdAt,
+		)
+		if err != nil {
+			log.Println("Error scanning message:", err)
+			continue
+		}
+
+		msg.Created = createdAt.Format("2006-01-02 15:04:05")
+		messages = append(messages, msg)
+	}
+
+	return c.JSON(http.StatusOK, messages)
+}
+
 func main() {
 	pool := LoadDB()
 	if pool == nil {
@@ -350,6 +413,7 @@ func main() {
 	e.POST("/sign_up", PostHandleSignUp)
 	e.POST("/sign_in", PostHandleSignIn)
 	e.POST("/send_message", SendMessage)
+	e.GET("/messages", GetMessages)
 
 	e.GET("/", func(c echo.Context) error {
 		return c.String(http.StatusOK, "Messenger API is running!")
