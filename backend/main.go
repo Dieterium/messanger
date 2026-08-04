@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -401,6 +402,145 @@ func GetMessages(c echo.Context) error {
 	return c.JSON(http.StatusOK, messages)
 }
 
+func GetDialog(c echo.Context) error {
+	authHeader := c.Request().Header.Get("Authorization")
+
+	if authHeader == "" {
+		return c.JSON(http.StatusUnauthorized, Response{
+			Status:  "Error",
+			Message: "Missing auth token",
+		})
+	}
+
+	TokenS := authHeader[7:]
+
+	userID, _, err := checkToken(TokenS)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, Response{
+			Status:  "Error",
+			Message: "Invalid token",
+		})
+	}
+
+	outherUserID, err := strconv.Atoi(c.Param("user_id"))
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, Response{
+			Status:  "Error",
+			Message: "Invalid user ID",
+		})
+	}
+
+	pool := LoadDB()
+	defer pool.Close()
+
+	var outherName string
+
+	err1 := pool.QueryRow(
+		context.Background(),
+		`SELECT "Name" FROM users WHERE id = $1`,
+		outherUserID,
+	).Scan(&outherName)
+
+	if err1 != nil {
+		return c.JSON(http.StatusNotFound, Response{
+			Status:  "Error",
+			Message: "User not found",
+		})
+	}
+
+	query := `SELECT id, "Text", author, to_name, created_at FROM messages
+	WHERE (id_user = $1 AND to_user_id = $2) OR (id_user = $2 AND to_user_id = $1) ORDER BY created_at ASC`
+
+	rows, err := pool.Query(context.Background(), query, userID, outherUserID)
+
+	if err != nil {
+		log.Println("Error fetching messages:", err)
+		return c.JSON(http.StatusInternalServerError, Response{
+			Status:  "Error",
+			Message: "Failed to fetch messages",
+		})
+	}
+
+	defer rows.Close()
+
+	var messages []MessageResp
+	for rows.Next() {
+		var msg MessageResp
+		var createdAt time.Time
+
+		err := rows.Scan(
+			&msg.ID,
+			&msg.Text,
+			&msg.From,
+			&msg.To,
+			&createdAt,
+		)
+		if err != nil {
+			log.Println("Error scanning message:", err)
+			continue
+		}
+
+		msg.Created = createdAt.Format("2006-01-02 15:04:05")
+		messages = append(messages, msg)
+	}
+
+	return c.JSON(http.StatusOK, messages)
+}
+
+func GetUsers(c echo.Context) error {
+	authHeader := c.Request().Header.Get("Authorization")
+
+	if authHeader == "" {
+		return c.JSON(http.StatusUnauthorized, Response{
+			Status:  "Error",
+			Message: "Missing auth token",
+		})
+	}
+
+	TokenS := authHeader[7:]
+
+	userID, _, err := checkToken(TokenS)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, Response{
+			Status:  "Error",
+			Message: "Invalid token",
+		})
+	}
+
+	pool := LoadDB()
+	defer pool.Close()
+
+	query := `SELECT id, "Name" FROM users WHERE id != $1 ORDER BY "Name" ASC`
+
+	rows, err := pool.Query(context.Background(), query, userID)
+	if err != nil {
+		log.Println("Error fetching users:", err)
+		return c.JSON(http.StatusInternalServerError, Response{
+			Status:  "Error",
+			Message: "Failed to fetch users",
+		})
+	}
+	defer rows.Close()
+
+	var users []map[string]interface{}
+	for rows.Next() {
+		var id int
+		var name string
+		err := rows.Scan(&id, &name)
+		if err != nil {
+			log.Println("Error scanning user:", err)
+			continue
+		}
+
+		users = append(users, map[string]interface{}{
+			"id":   id,
+			"name": name,
+		})
+	}
+
+	return c.JSON(http.StatusOK, users)
+}
+
 func main() {
 	pool := LoadDB()
 	if pool == nil {
@@ -414,6 +554,8 @@ func main() {
 	e.POST("/sign_in", PostHandleSignIn)
 	e.POST("/send_message", SendMessage)
 	e.GET("/messages", GetMessages)
+	e.GET("/messages/:user_id", GetDialog)
+	e.GET("/users", GetUsers)
 
 	e.GET("/", func(c echo.Context) error {
 		return c.String(http.StatusOK, "Messenger API is running!")
