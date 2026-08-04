@@ -15,20 +15,6 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-type User struct {
-	Id         int    `json:"id"`
-	Name       string `json:"name"`
-	Password   string `json:"password"`
-	Public_key string `json:"public_key"`
-}
-
-type Message struct {
-	Id      int    `json:"id"`
-	Text    string `json:"text"`
-	Author  string `json:"author"`
-	Id_user int    `json:"id_user"`
-}
-
 type SignUpReq struct {
 	Name       string `json:"name"`
 	Password   string `json:"password"`
@@ -49,6 +35,19 @@ type SignInResp struct {
 type Response struct {
 	Status  string `json:"status"`
 	Message string `json:"message"`
+}
+
+type SendMessageReq struct {
+	ToUserID int    `json:"toUserId"`
+	Text     string `json:"text"`
+}
+
+type MessageResp struct {
+	ID      int    `json:"id"`
+	From    string `json:"from"`
+	To      string `json:"to"`
+	Text    string `json:"text"`
+	Created string `json:"created"`
 }
 
 func hashPassword(password string) (string, error) {
@@ -197,14 +196,14 @@ func PostHandleSignIn(c echo.Context) error {
 	var req SignInReq
 
 	if err := c.Bind(&req); err != nil {
-		c.JSON(http.StatusBadRequest, Response{
+		return c.JSON(http.StatusBadRequest, Response{
 			Status:  "Error",
 			Message: "Uncorect form request",
 		})
 	}
 
 	if req.Name == "" || req.Password == "" {
-		c.JSON(http.StatusBadRequest, Response{
+		return c.JSON(http.StatusBadRequest, Response{
 			Status:  "Error",
 			Message: "Username and password are required",
 		})
@@ -244,7 +243,7 @@ func PostHandleSignIn(c echo.Context) error {
 
 	token, err := generateToken(userID, name)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, Response{
+		return c.JSON(http.StatusInternalServerError, Response{
 			Status:  "Error",
 			Message: "Failed to generate token",
 		})
@@ -254,6 +253,88 @@ func PostHandleSignIn(c echo.Context) error {
 		Status:  "Success",
 		Message: "Login soccessful",
 		Token:   token,
+	})
+}
+
+func SendMessage(c echo.Context) error {
+	authHeader := c.Request().Header.Get("Authorization")
+
+	if authHeader == "" {
+		return c.JSON(http.StatusUnauthorized, Response{
+			Status:  "Error",
+			Message: "Missing auth token",
+		})
+	}
+
+	TokenS := authHeader[7:]
+
+	userID, username, err := checkToken(TokenS)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, Response{
+			Status:  "Error",
+			Message: "Invalid token",
+		})
+	}
+
+	var req SendMessageReq
+
+	if err := c.Bind(&req); err != nil {
+		return c.JSON(http.StatusBadRequest, Response{
+			Status:  "Error",
+			Message: "Incorect format request",
+		})
+	}
+
+	if req.Text == "" {
+		return c.JSON(http.StatusBadRequest, Response{
+			Status:  "Error",
+			Message: "Message text is required",
+		})
+	}
+
+	pool := LoadDB()
+	defer pool.Close()
+
+	var TouserId int
+	var TouserName string
+
+	query := `SELECT id, "Name" FROM "users" WHERE id = $1`
+
+	errr := pool.QueryRow(
+		context.Background(),
+		query,
+		req.ToUserID,
+	).Scan(&TouserId, &TouserName)
+
+	if errr != nil {
+		return c.JSON(http.StatusUnauthorized, Response{
+			Status:  "Error",
+			Message: "Recipient not found",
+		})
+	}
+
+	query1 := `INSERT INTO "messages" ("Text", "author", "id_user") VALUES ($1, $2, $3) RETURNING id`
+
+	var MessageID int
+	err1 := pool.QueryRow(
+		context.Background(),
+		query1,
+		req.Text,
+		username,
+		userID,
+	).Scan(&MessageID)
+
+	if err1 != nil {
+		log.Println("Error saving message:", err1)
+		return c.JSON(http.StatusInternalServerError, Response{
+			Status:  "Error",
+			Message: "Failed to save message",
+		})
+	}
+
+	return c.JSON(http.StatusCreated, Response{
+		Status:  "Success",
+		Message: fmt.Sprintf("Message sent to %s (ID: %d)", TouserName, MessageID),
 	})
 }
 
@@ -268,6 +349,7 @@ func main() {
 
 	e.POST("/sign_up", PostHandleSignUp)
 	e.POST("/sign_in", PostHandleSignIn)
+	e.POST("/send_message", SendMessage)
 
 	e.GET("/", func(c echo.Context) error {
 		return c.String(http.StatusOK, "Messenger API is running!")
