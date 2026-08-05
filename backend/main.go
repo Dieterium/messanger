@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -40,6 +41,7 @@ type SignInResp struct {
 	Status  string `json:"status"`
 	Message string `json:"message"`
 	Token   string `json:"token,omitempty"`
+	UserID  int    `json:"userId"`
 }
 
 type Response struct {
@@ -393,6 +395,7 @@ func PostHandleSignIn(c echo.Context) error {
 		Status:  "Success",
 		Message: "Login soccessful",
 		Token:   token,
+		UserID:  userID,
 	})
 }
 
@@ -662,6 +665,12 @@ func main() {
 	defer pool.Close()
 
 	e := echo.New()
+
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: []string{"*"},
+		AllowMethods: []string{echo.GET, echo.POST, echo.PUT, echo.DELETE, echo.OPTIONS},
+		AllowHeaders: []string{"Content-Type", "Authorization"},
+	}))
 
 	e.POST("/sign_up", PostHandleSignUp)
 	e.POST("/sign_in", PostHandleSignIn)

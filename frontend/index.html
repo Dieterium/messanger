@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Messenger</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; background: #1a1a2e; color: #fff; padding: 20px; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { color: #e94560; text-align: center; margin-bottom: 20px; }
+        .hidden { display: none !important; }
+        .box { background: #16213e; padding: 15px; border-radius: 10px; margin-bottom: 15px; }
+        .row { display: flex; gap: 10px; flex-wrap: wrap; }
+        input, button { padding: 10px; border-radius: 5px; border: none; font-size: 14px; }
+        input { background: #0f3460; color: #fff; flex: 1; min-width: 100px; }
+        input::placeholder { color: #888; }
+        button { background: #e94560; color: #fff; cursor: pointer; }
+        button:hover { opacity: 0.8; }
+        .main-layout { display: flex; gap: 15px; }
+        .sidebar { flex: 1; min-width: 150px; }
+        .chat-area { flex: 2; }
+        .user-item { padding: 10px; background: #0f3460; border-radius: 5px; margin-bottom: 5px; cursor: pointer; }
+        .user-item:hover { background: #1a4a7a; }
+        .user-item.active { background: #e94560; }
+        .messages { max-height: 400px; overflow-y: auto; display: flex; flex-direction: column; gap: 5px; padding: 5px; }
+        .msg { padding: 8px 12px; border-radius: 8px; max-width: 70%; word-wrap: break-word; }
+        .msg.me { background: #e94560; align-self: flex-end; }
+        .msg.other { background: #0f3460; align-self: flex-start; }
+        .msg small { display: block; font-size: 10px; opacity: 0.7; margin-top: 3px; }
+        .status { color: #888; font-size: 12px; text-align: center; }
+        .ws-online { color: #4caf50; }
+        .ws-offline { color: #e94560; }
+        .logout-btn { background: #555; padding: 5px 15px; }
+        .chat-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+<div class="container" id="app">
+
+    <h1>💬 Messenger</h1>
+
+    <!-- Auth -->
+    <div id="auth" class="box">
+        <div class="row">
+            <input id="auth-username" placeholder="Username">
+            <input id="auth-password" type="password" placeholder="Password">
+            <button id="btn-login">Login</button>
+            <button id="btn-register">Register</button>
+        </div>
+        <div id="auth-status" class="status"></div>
+    </div>
+
+    <!-- Chat -->
+    <div id="chat" class="hidden">
+        <div class="main-layout">
+            <!-- Sidebar: Users -->
+            <div class="sidebar box">
+                <div style="margin-bottom:10px; display:flex; justify-content:space-between;">
+                    <span>👥 Users</span>
+                    <button class="logout-btn" id="btn-logout">Logout</button>
+                </div>
+                <div id="users-list"></div>
+                <div id="ws-status" class="status" style="margin-top:10px;">🔴 disconnected</div>
+            </div>
+
+            <!-- Chat area -->
+            <div class="chat-area box">
+                <div class="chat-header">
+                    <span id="chat-with" style="color:#aaa;">Select a user</span>
+                </div>
+                <div id="messages" class="messages"></div>
+                <div class="row" style="margin-top:10px;">
+                    <input id="msg-input" placeholder="Type a message...">
+                    <button id="btn-send">Send</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script>
+    const API = 'http://localhost:8080';
+    let token = '';
+    let currentUser = '';
+    let currentUserId = 0;
+    let selectedUserId = 0;
+    let ws = null;
+    let messagesCache = {};
+
+    // DOM
+    const $ = id => document.getElementById(id);
+    const authDiv = $('auth');
+    const chatDiv = $('chat');
+    const usersList = $('users-list');
+    const messagesDiv = $('messages');
+    const msgInput = $('msg-input');
+    const chatWith = $('chat-with');
+    const wsStatus = $('ws-status');
+    const authStatus = $('auth-status');
+
+    // ===== Auth =====
+    async function apiCall(endpoint, method, body, needAuth) {
+        const opts = {
+            method: method,
+            headers: { 'Content-Type': 'application/json' }
+        };
+        if (needAuth) opts.headers['Authorization'] = 'Bearer ' + token;
+        if (body) opts.body = JSON.stringify(body);
+        const res = await fetch(API + endpoint, opts);
+        return res.json();
+    }
+
+    $('btn-login').onclick = async () => {
+        const name = $('auth-username').value.trim();
+        const pass = $('auth-password').value.trim();
+        if (!name || !pass) { authStatus.textContent = 'Fill all fields'; return; }
+        const data = await apiCall('/sign_in', 'POST', { name, password: pass });
+        if (data.token) {
+            token = data.token;
+            currentUser = name;
+            authStatus.textContent = '✅ Login success!';
+            authDiv.classList.add('hidden');
+            chatDiv.classList.remove('hidden');
+            await loadUsers();
+            connectWS();
+        } else {
+            authStatus.textContent = '❌ ' + (data.message || 'Login failed');
+        }
+    };
+
+    $('btn-register').onclick = async () => {
+        const name = $('auth-username').value.trim();
+        const pass = $('auth-password').value.trim();
+        if (!name || !pass) { authStatus.textContent = 'Fill all fields'; return; }
+        const data = await apiCall('/sign_up', 'POST', {
+            name, password: pass, public_key: 'key_' + Date.now()
+        });
+        authStatus.textContent = data.status === 'Success' ? '✅ Registered! Now login.' : '❌ ' + data.message;
+    };
+
+    $('btn-logout').onclick = () => {
+        if (ws) ws.close();
+        token = '';
+        currentUser = '';
+        chatDiv.classList.add('hidden');
+        authDiv.classList.remove('hidden');
+        authStatus.textContent = '';
+        usersList.innerHTML = '';
+        messagesDiv.innerHTML = '';
+        messagesCache = {};
+    };
+
+    // ===== Users =====
+    async function loadUsers() {
+        const data = await apiCall('/users', 'GET', null, true);
+        if (!Array.isArray(data)) return;
+        usersList.innerHTML = '';
+        data.forEach(u => {
+            const div = document.createElement('div');
+            div.className = 'user-item' + (u.id === selectedUserId ? ' active' : '');
+            div.textContent = u.name;
+            div.onclick = () => selectUser(u.id, u.name);
+            usersList.appendChild(div);
+        });
+        if (selectedUserId) {
+            await loadMessages(selectedUserId);
+            // Подсветка
+            document.querySelectorAll('.user-item').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.user-item').forEach(el => {
+                if (el.textContent === getUserName(selectedUserId)) el.classList.add('active');
+            });
+        }
+    }
+
+    function getUserName(id) {
+        const items = document.querySelectorAll('.user-item');
+        for (const el of items) {
+            // ищем по ID сложнее, упростим - храним в data
+        }
+        return '';
+    }
+
+    // ===== Messages =====
+    async function loadMessages(userId) {
+        const data = await apiCall('/messages/' + userId, 'GET', null, true);
+        if (!Array.isArray(data)) return;
+        messagesCache[userId] = data;
+        renderMessages(userId);
+    }
+
+    function renderMessages(userId) {
+        const msgs = messagesCache[userId] || [];
+        messagesDiv.innerHTML = '';
+        msgs.forEach(m => {
+            const div = document.createElement('div');
+            div.className = 'msg ' + (m.from === currentUser ? 'me' : 'other');
+            div.innerHTML = m.text + '<small>' + m.from + ' ' + m.created + '</small>';
+            messagesDiv.appendChild(div);
+        });
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
+
+    function selectUser(id, name) {
+        selectedUserId = id;
+        chatWith.textContent = '💬 Chat with ' + name;
+        document.querySelectorAll('.user-item').forEach(el => el.classList.remove('active'));
+        document.querySelectorAll('.user-item').forEach(el => {
+            if (el.textContent === name) el.classList.add('active');
+        });
+        // Загружаем сообщения из кэша или с сервера
+        if (messagesCache[id]) {
+            renderMessages(id);
+        } else {
+            loadMessages(id);
+        }
+    }
+
+    // ===== Send =====
+    $('btn-send').onclick = sendMessage;
+    msgInput.onkeydown = e => { if (e.key === 'Enter') sendMessage(); };
+
+    async function sendMessage() {
+        const text = msgInput.value.trim();
+        if (!text || !selectedUserId) return;
+        msgInput.value = '';
+
+        // Отправляем через REST
+        const data = await apiCall('/send_message', 'POST', {
+            toUserId: selectedUserId,
+            text: text
+        }, true);
+
+        if (data.status === 'Success') {
+            // Добавляем в кэш
+            if (!messagesCache[selectedUserId]) messagesCache[selectedUserId] = [];
+            messagesCache[selectedUserId].push({
+                from: currentUser,
+                text: text,
+                created: new Date().toLocaleString()
+            });
+            renderMessages(selectedUserId);
+        } else {
+            alert('Send failed: ' + data.message);
+        }
+    }
+
+    // ===== WebSocket =====
+    function connectWS() {
+        if (ws) ws.close();
+        ws = new WebSocket('ws://localhost:8080/ws?token=' + token);
+
+        ws.onopen = () => {
+            wsStatus.textContent = '🟢 connected';
+            wsStatus.className = 'status ws-online';
+        };
+
+        ws.onclose = () => {
+            wsStatus.textContent = '🔴 disconnected';
+            wsStatus.className = 'status ws-offline';
+            setTimeout(connectWS, 3000);
+        };
+
+        ws.onerror = () => {
+            wsStatus.textContent = '⚠️ error';
+            wsStatus.className = 'status ws-offline';
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                console.log('WS:', msg);
+
+                // Если это сообщение
+                if (msg.type === 'message' || msg.from_user) {
+                    const from = msg.from_user || 'unknown';
+                    // Определяем ID собеседника
+                    let otherId = 0;
+                    if (from === currentUser) {
+                        // Мы отправили - это сообщение для нас
+                        otherId = msg.to_user_id;
+                    } else {
+                        // Нам прислали
+                        otherId = 1; // упрощённо, нужно получать из списка
+                    }
+                    // Ищем ID по имени
+                    const items = document.querySelectorAll('.user-item');
+                    for (const el of items) {
+                        if (el.textContent === from) {
+                            otherId = 1; // тут надо реальный ID
+                        }
+                    }
+
+                    // Добавляем в кэш для собеседника
+                    const userId = from === currentUser ? msg.to_user_id : 1;
+                    if (!messagesCache[userId]) messagesCache[userId] = [];
+                    messagesCache[userId].push({
+                        from: from,
+                        text: msg.text,
+                        created: msg.time || new Date().toLocaleString()
+                    });
+                    if (selectedUserId === userId) {
+                        renderMessages(userId);
+                    }
+                }
+            } catch(e) {
+                console.error('WS parse error:', e);
+            }
+        };
+    }
+
+    console.log('🚀 Messenger loaded');
+</script>
+</body>
+</html>
