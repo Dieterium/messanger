@@ -7,14 +7,23 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/gorilla/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/labstack/echo/v4"
 	"golang.org/x/crypto/bcrypt"
 )
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+var Clients = make(map[int]*Client)
+var ClientsMutex sync.Mutex
 
 type SignUpReq struct {
 	Name       string `json:"name"`
@@ -49,6 +58,136 @@ type MessageResp struct {
 	To      string `json:"to"`
 	Text    string `json:"text"`
 	Created string `json:"created"`
+}
+
+type WSMessage struct {
+	Type     string `json:"type"`
+	ToUserID int    `json:"to_user_id"`
+	Text     string `json:"text"`
+	FromUser string `json:"from_user"`
+	Time     string `json:"time"`
+}
+
+type Client struct {
+	Conn   *websocket.Conn
+	UserID int
+	Name   string
+}
+
+func WebSocketHendler(c echo.Context) error {
+	token := c.QueryParam("token")
+	if token == "" {
+		return c.JSON(http.StatusUnauthorized, Response{
+			Status:  "Error",
+			Message: "Missing token",
+		})
+	}
+
+	userID, username, err := checkToken(token)
+	if err != nil {
+		return c.JSON(http.StatusUnauthorized, Response{
+			Status:  "Error",
+			Message: "Invalid Token",
+		})
+	}
+
+	conn, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
+	if err != nil {
+		log.Println("WebSocket upgrade error:", err)
+		return err
+	}
+
+	defer conn.Close()
+
+	client := &Client{
+		Conn:   conn,
+		UserID: userID,
+		Name:   username,
+	}
+
+	ClientsMutex.Lock()
+	Clients[userID] = client
+	ClientsMutex.Unlock()
+
+	log.Printf("User %s (ID: %d) connected to WebSocket", username, userID)
+
+	defer func() {
+		ClientsMutex.Lock()
+		delete(Clients, userID)
+		ClientsMutex.Unlock()
+		log.Printf("User %s (ID: %d) disconnected", username, userID)
+	}()
+
+	for {
+		var msg WSMessage
+		err := conn.ReadJSON(&msg)
+		if err != nil {
+			break
+		}
+
+		msg.FromUser = username
+		msg.Time = time.Now().Format("15:04:05")
+
+		log.Printf("%s → user %d: %s", username, msg.ToUserID, msg.Text)
+
+		_, err = SaveMessageToDB(userID, username, msg.ToUserID, msg.Text)
+		if err != nil {
+			log.Println("Error saving message to DB:", err)
+		} else {
+			log.Printf("Message saved to DB")
+		}
+
+		ClientsMutex.Lock()
+		receiver, exists := Clients[msg.ToUserID]
+		ClientsMutex.Unlock()
+
+		if exists {
+			err = receiver.Conn.WriteJSON(msg)
+			if err != nil {
+				log.Println("Error sending to receiver:", err)
+			} else {
+				log.Printf("Sent to %s (ID: %d)", receiver.Name, msg.ToUserID)
+			}
+		} else {
+			log.Printf("User %d is offline", msg.ToUserID)
+		}
+	}
+
+	return nil
+}
+
+func SaveMessageToDB(sendrID int, senderName string, ToUserID int, text string) (int, error) {
+	pool := LoadDB()
+	defer pool.Close()
+
+	var TouserName string
+
+	query := `SELECT "Name" FROM "users" WHERE id = $1`
+
+	errr := pool.QueryRow(
+		context.Background(),
+		query,
+		ToUserID,
+	).Scan(&TouserName)
+
+	if errr != nil {
+		return 0, fmt.Errorf("recipient not found: %w", errr)
+	}
+
+	query1 := `INSERT INTO "messages" ("Text", "author", "id_user", "to_user_id", "to_name") VALUES ($1, $2, $3, $4, $5) RETURNING id`
+
+	var MessageID int
+	err1 := pool.QueryRow(
+		context.Background(),
+		query1,
+		text,
+		senderName,
+		sendrID,
+		ToUserID,
+		TouserName,
+	).Scan(&MessageID)
+
+	return MessageID, err1
 }
 
 func hashPassword(password string) (string, error) {
@@ -259,7 +398,6 @@ func PostHandleSignIn(c echo.Context) error {
 
 func SendMessage(c echo.Context) error {
 	authHeader := c.Request().Header.Get("Authorization")
-
 	if authHeader == "" {
 		return c.JSON(http.StatusUnauthorized, Response{
 			Status:  "Error",
@@ -267,9 +405,9 @@ func SendMessage(c echo.Context) error {
 		})
 	}
 
-	TokenS := authHeader[7:]
+	tokenString := authHeader[7:]
 
-	userID, username, err := checkToken(TokenS)
+	userID, username, err := checkToken(tokenString)
 	if err != nil {
 		return c.JSON(http.StatusUnauthorized, Response{
 			Status:  "Error",
@@ -278,11 +416,10 @@ func SendMessage(c echo.Context) error {
 	}
 
 	var req SendMessageReq
-
 	if err := c.Bind(&req); err != nil {
 		return c.JSON(http.StatusBadRequest, Response{
 			Status:  "Error",
-			Message: "Incorect format request",
+			Message: "Incorrect format request",
 		})
 	}
 
@@ -293,51 +430,27 @@ func SendMessage(c echo.Context) error {
 		})
 	}
 
-	pool := LoadDB()
-	defer pool.Close()
-
-	var TouserId int
-	var TouserName string
-
-	query := `SELECT id, "Name" FROM "users" WHERE id = $1`
-
-	errr := pool.QueryRow(
-		context.Background(),
-		query,
-		req.ToUserID,
-	).Scan(&TouserId, &TouserName)
-
-	if errr != nil {
-		return c.JSON(http.StatusUnauthorized, Response{
-			Status:  "Error",
-			Message: "Recipient not found",
-		})
-	}
-
-	query1 := `INSERT INTO "messages" ("Text", "author", "id_user", "to_user_id", "to_name") VALUES ($1, $2, $3, $4, $5) RETURNING id`
-
-	var MessageID int
-	err1 := pool.QueryRow(
-		context.Background(),
-		query1,
-		req.Text,
-		username,
-		userID,
-		req.ToUserID,
-		TouserName,
-	).Scan(&MessageID)
-
-	if err1 != nil {
-		log.Println("Error saving message:", err1)
+	messageID, err := SaveMessageToDB(userID, username, req.ToUserID, req.Text)
+	if err != nil {
+		log.Println("Error saving message:", err)
 		return c.JSON(http.StatusInternalServerError, Response{
 			Status:  "Error",
 			Message: "Failed to save message",
 		})
 	}
 
+	var toUsername string
+	pool := LoadDB()
+	defer pool.Close()
+	pool.QueryRow(
+		context.Background(),
+		`SELECT "Name" FROM users WHERE id = $1`,
+		req.ToUserID,
+	).Scan(&toUsername)
+
 	return c.JSON(http.StatusCreated, Response{
 		Status:  "Success",
-		Message: fmt.Sprintf("Message sent to %s (ID: %d)", TouserName, MessageID),
+		Message: fmt.Sprintf("Message sent to %s (ID: %d)", toUsername, messageID),
 	})
 }
 
@@ -556,6 +669,7 @@ func main() {
 	e.GET("/messages", GetMessages)
 	e.GET("/messages/:user_id", GetDialog)
 	e.GET("/users", GetUsers)
+	e.GET("/ws", WebSocketHendler)
 
 	e.GET("/", func(c echo.Context) error {
 		return c.String(http.StatusOK, "Messenger API is running!")
