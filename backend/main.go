@@ -426,6 +426,8 @@ func SendMessage(c echo.Context) error {
 		})
 	}
 
+	log.Printf("📩 Received message: to_user=%d, text_len=%d", req.ToUserID, len(req.Text))
+
 	if req.Text == "" {
 		return c.JSON(http.StatusBadRequest, Response{
 			Status:  "Error",
@@ -626,7 +628,7 @@ func GetUsers(c echo.Context) error {
 	pool := LoadDB()
 	defer pool.Close()
 
-	query := `SELECT id, "Name" FROM users WHERE id != $1 ORDER BY "Name" ASC`
+	query := `SELECT id, "Name", "public_key" FROM users WHERE id != $1 ORDER BY "Name" ASC`
 
 	rows, err := pool.Query(context.Background(), query, userID)
 	if err != nil {
@@ -642,15 +644,17 @@ func GetUsers(c echo.Context) error {
 	for rows.Next() {
 		var id int
 		var name string
-		err := rows.Scan(&id, &name)
+		var publicKey string
+		err := rows.Scan(&id, &name, &publicKey)
 		if err != nil {
 			log.Println("Error scanning user:", err)
 			continue
 		}
 
 		users = append(users, map[string]interface{}{
-			"id":   id,
-			"name": name,
+			"id":         id,
+			"name":       name,
+			"public_key": publicKey,
 		})
 	}
 
