@@ -2,15 +2,13 @@
 
 # ========================================================================
 #  💬 MESSENGER CLI — RSA Encrypted Messenger
-#  Красивый, стабильный, без WebSocket
+#  Версия с отдельными ключами для каждого пользователя
 # ========================================================================
 
 # ===== КОНФИГ =====
 API="http://localhost:8080"
 KEY_DIR="$HOME/.messenger_keys"
 TOKEN_FILE="$HOME/.messenger_token"
-PRIVATE_KEY="$KEY_DIR/private.pem"
-PUBLIC_KEY="$KEY_DIR/public.pem"
 
 # ===== ЦВЕТА =====
 RESET='\033[0m'
@@ -32,6 +30,15 @@ BRIGHT_MAGENTA='\033[1;35m'
 
 mkdir -p "$KEY_DIR"
 
+# ===== ХРАНЕНИЕ КЛЮЧЕЙ ПО ПОЛЬЗОВАТЕЛЯМ =====
+get_private_key() {
+    echo "$KEY_DIR/${1}_private.pem"
+}
+
+get_public_key() {
+    echo "$KEY_DIR/${1}_public.pem"
+}
+
 # ===== ЛОГОТИП =====
 show_logo() {
     clear
@@ -44,7 +51,7 @@ show_logo() {
     echo "   ╚═╝     ╚═╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝"
     echo -e "${RESET}"
     echo -e "${BRIGHT_MAGENTA}  ═══ Encrypted MESSANGER CLI v2.0 ═══${RESET}"
-    echo -e "${DIM}  🔐 RSA 2048-bit | No WebSocket | Stable${RESET}"
+    echo -e "${DIM}  🔐 RSA 2048-bit | Separate keys per user${RESET}"
     echo ""
 }
 
@@ -57,6 +64,11 @@ check_auth() {
         return 1
     fi
     return 0
+}
+
+get_current_user() {
+    local token=$(get_token)
+    echo "$token" | cut -d'.' -f2 | base64 -d 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4
 }
 
 api_get() {
@@ -81,7 +93,14 @@ format_pem() {
 # ===== РАСШИФРОВКА =====
 decrypt_msg() {
     local encrypted="$1"
-    echo "$encrypted" | base64 -d 2>/dev/null | openssl rsautl -decrypt -inkey "$PRIVATE_KEY" 2>/dev/null | tr -d '\0' 2>/dev/null
+    local current_user=$(get_current_user)
+    local private_key=$(get_private_key "$current_user")
+    
+    if [ ! -f "$private_key" ]; then
+        return 1
+    fi
+    
+    echo "$encrypted" | base64 -d 2>/dev/null | openssl rsautl -decrypt -inkey "$private_key" 2>/dev/null | tr -d '\0' 2>/dev/null
 }
 
 # ========================================================================
@@ -89,18 +108,36 @@ decrypt_msg() {
 # ========================================================================
 
 cmd_gen_keys() {
-    echo -e "${BLUE}🔑 Generating RSA 2048-bit keys...${RESET}"
-    openssl genrsa -out "$PRIVATE_KEY" 2048 2>/dev/null
-    openssl rsa -in "$PRIVATE_KEY" -pubout -out "$PUBLIC_KEY" 2>/dev/null
-    echo -e "${GREEN}✅ Keys saved to ${YELLOW}$KEY_DIR${RESET}"
+    local username="$1"
+    
+    if [ -z "$username" ]; then
+        echo -e "${RED}❌ Usage: gen_keys <username>${RESET}"
+        echo -e "${DIM}Example: gen_keys alice${RESET}"
+        return 1
+    fi
+    
+    local private_key=$(get_private_key "$username")
+    local public_key=$(get_public_key "$username")
+    
+    echo -e "${BLUE}🔑 Generating RSA 2048-bit keys for ${YELLOW}$username${RESET}..."
+    openssl genrsa -out "$private_key" 2048 2>/dev/null
+    openssl rsa -in "$private_key" -pubout -out "$public_key" 2>/dev/null
+    echo -e "${GREEN}✅ Keys saved:${RESET}"
+    echo -e "  ${DIM}Private: $private_key${RESET}"
+    echo -e "  ${DIM}Public:  $public_key${RESET}"
 }
 
 cmd_register() {
     local username="$1" password="$2"
     [ -z "$username" ] || [ -z "$password" ] && { echo -e "${RED}❌ Usage: register <user> <pass>${RESET}"; return 1; }
-    [ ! -f "$PUBLIC_KEY" ] && { echo -e "${RED}❌ No public key. Run: gen_keys${RESET}"; return 1; }
+    
+    local public_key=$(get_public_key "$username")
+    if [ ! -f "$public_key" ]; then
+        echo -e "${RED}❌ No public key for $username. Run: ${CYAN}gen_keys $username${RESET}"
+        return 1
+    fi
 
-    local pubkey=$(cat "$PUBLIC_KEY" | sed 's/"/\\"/g' | tr -d '\n')
+    local pubkey=$(cat "$public_key" | sed 's/"/\\"/g' | tr -d '\n')
     echo -e "${BLUE}📝 Registering ${YELLOW}$username${RESET}..."
     local resp=$(curl -s -X POST "$API/sign_up" -H "Content-Type: application/json" -d "{\"name\":\"$username\",\"password\":\"$password\",\"public_key\":\"$pubkey\"}")
     echo "$resp" | grep -q "Success" && echo -e "${GREEN}✅ User $username registered!${RESET}" || echo -e "${RED}❌ Registration failed: $resp${RESET}"
@@ -174,7 +211,14 @@ cmd_dialog() {
     local with_user="$1"
     [ -z "$with_user" ] && { echo -e "${RED}❌ Usage: dialog <user>${RESET}"; return 1; }
     check_auth || return 1
-    [ ! -f "$PRIVATE_KEY" ] && { echo -e "${RED}❌ Private key not found. Run: gen_keys${RESET}"; return 1; }
+
+    local current_user=$(get_current_user)
+    local private_key=$(get_private_key "$current_user")
+    
+    if [ ! -f "$private_key" ]; then
+        echo -e "${RED}❌ Private key not found for $current_user. Run: ${CYAN}gen_keys $current_user${RESET}"
+        return 1
+    fi
 
     local users=$(api_get "/users")
     local user_id=$(echo "$users" | grep -o "\"id\":[0-9]*,\"name\":\"$with_user\"" | grep -o '[0-9]*' | head -1)
@@ -187,32 +231,41 @@ cmd_dialog() {
     local messages=$(api_get "/messages/$user_id")
     [ -z "$messages" ] || [ "$messages" = "null" ] || [ "$messages" = "[]" ] && { echo -e "${YELLOW}📭 No messages yet${RESET}"; return 0; }
 
-    echo "$messages" | sed 's/{"id":/\n{"id":/g' | grep '{"id":' | while read -r entry; do
+        echo "$messages" | sed 's/{"id":/\n{"id":/g' | grep '{"id":' | while read -r entry; do
         local from=$(echo "$entry" | grep -o '"from":"[^"]*"' | head -1 | cut -d'"' -f4)
+        local to=$(echo "$entry" | grep -o '"to":"[^"]*"' | head -1 | cut -d'"' -f4)
         local text=$(echo "$entry" | sed 's/.*"text":"//' | sed 's/","created":.*//')
         local created=$(echo "$entry" | grep -o '"created":"[^"]*"' | head -1 | cut -d'"' -f4)
 
         local decrypted=""
-        if [[ "$text" =~ ^[A-Za-z0-9+/=]+$ ]]; then
-            decrypted=$(decrypt_msg "$text")
+        local is_encrypted=false
+        
+        if [[ "$text" =~ ^[A-Za-z0-9+/=]+$ ]] && [ ${#text} -gt 20 ]; then
+            is_encrypted=true
+            decrypted=$(echo "$text" | base64 -d 2>/dev/null | openssl rsautl -decrypt -inkey "$private_key" 2>/dev/null | tr -d '\0' 2>/dev/null)
         fi
 
-        if [ -n "$decrypted" ]; then
-            echo -e "${BRIGHT_YELLOW}$from${RESET} → ${BRIGHT_GREEN}$decrypted${RESET} ${DIM}($created)${RESET} ${BRIGHT_GREEN}🔓${RESET}"
+        # ✅ ГЛАВНОЕ ИСПРАВЛЕНИЕ: если мы отправитель — показываем [sent]
+        if [ "$from" = "$current_user" ]; then
+            echo -e "${BRIGHT_YELLOW}📤 You${RESET} → ${DIM}[sent to $to]${RESET} ${DIM}($created)${RESET}"
+        elif [ -n "$decrypted" ]; then
+            echo -e "${BRIGHT_YELLOW}📩 $from${RESET} → ${BRIGHT_GREEN}$decrypted${RESET} ${DIM}($created)${RESET} ${BRIGHT_GREEN}🔓${RESET}"
+        elif [ "$to" = "$current_user" ] && [ "$is_encrypted" = true ]; then
+            echo -e "${BRIGHT_YELLOW}📩 $from${RESET} → ${RED}[cannot decrypt]${RESET} ${DIM}($created)${RESET} ${RED}🔒${RESET}"
         else
-            echo -e "${BRIGHT_YELLOW}$from${RESET} → ${RED}[encrypted]${RESET} ${DIM}($created)${RESET} ${RED}🔒${RESET}"
+            echo -e "${DIM}$from → [message] ($created)${RESET}"
         fi
     done
 }
 
 # ========================================================================
-#  ИНТЕРАКТИВНЫЙ ЧАТ (БЕЗ WEBSOCKET)
+#  ИНТЕРАКТИВНЫЙ ЧАТ
 # ========================================================================
 
 cmd_chat() {
     check_auth || return 1
 
-    local username=$(curl -s -X GET "$API/users" -H "Authorization: Bearer $(get_token)" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
+    local username=$(get_current_user)
     show_logo
     echo -e "${BRIGHT_GREEN}  🔐 Welcome, ${BRIGHT_YELLOW}$username${BRIGHT_GREEN}!${RESET}"
     echo -e "${DIM}  Type /help for commands | /quit to exit${RESET}"
@@ -266,21 +319,41 @@ cmd_chat() {
 cmd_status() {
     echo -e "${BRIGHT_BLUE}📊 Status:${RESET}"
     [ -f "$TOKEN_FILE" ] && echo -e "  ${GREEN}✅ Logged in${RESET}" || echo -e "  ${RED}❌ Not logged in${RESET}"
-    [ -f "$PUBLIC_KEY" ] && echo -e "  ${GREEN}✅ Public key${RESET}" || echo -e "  ${RED}❌ Public key${RESET}"
-    [ -f "$PRIVATE_KEY" ] && echo -e "  ${GREEN}✅ Private key${RESET}" || echo -e "  ${RED}❌ Private key${RESET}"
+    
+    local current_user=$(get_current_user)
+    if [ -n "$current_user" ]; then
+        local private_key=$(get_private_key "$current_user")
+        local public_key=$(get_public_key "$current_user")
+        [ -f "$public_key" ] && echo -e "  ${GREEN}✅ Public key for $current_user${RESET}" || echo -e "  ${RED}❌ Public key for $current_user${RESET}"
+        [ -f "$private_key" ] && echo -e "  ${GREEN}✅ Private key for $current_user${RESET}" || echo -e "  ${RED}❌ Private key for $current_user${RESET}"
+    else
+        echo -e "  ${DIM}No user logged in${RESET}"
+    fi
 }
 
 cmd_clean() {
-    rm -f "$PRIVATE_KEY" "$PUBLIC_KEY" "$TOKEN_FILE"
+    echo -e "${YELLOW}🗑️  Cleaning all keys and token...${RESET}"
+    rm -rf "$KEY_DIR" "$TOKEN_FILE"
     echo -e "${GREEN}✅ Cleaned${RESET}"
+}
+
+cmd_list_keys() {
+    echo -e "${BRIGHT_BLUE}📋 Stored keys:${RESET}"
+    if [ -d "$KEY_DIR" ]; then
+        ls -la "$KEY_DIR" | grep -E '_(public|private)\.pem' | while read -r line; do
+            echo "  $line"
+        done
+    else
+        echo -e "  ${DIM}No keys found${RESET}"
+    fi
 }
 
 cmd_help() {
     show_logo
     echo -e "${BRIGHT_WHITE}  COMMANDS:${RESET}"
     echo ""
-    echo -e "  ${CYAN}gen_keys${RESET}              — Generate RSA key pair"
-    echo -e "  ${CYAN}register <user> <pass>${RESET} — Register new user"
+    echo -e "  ${CYAN}gen_keys <user>${RESET}        — Generate RSA keys for user"
+    echo -e "  ${CYAN}register <user> <pass>${RESET} — Register user"
     echo -e "  ${CYAN}login <user> <pass>${RESET}    — Login"
     echo -e "  ${CYAN}logout${RESET}                 — Logout"
     echo -e "  ${CYAN}users${RESET}                  — List all users"
@@ -288,16 +361,16 @@ cmd_help() {
     echo -e "  ${CYAN}dialog <user>${RESET}          — Show dialog with decryption"
     echo -e "  ${CYAN}chat${RESET}                   — Interactive chat mode"
     echo -e "  ${CYAN}status${RESET}                 — Show current status"
+    echo -e "  ${CYAN}list_keys${RESET}              — List all stored keys"
     echo -e "  ${CYAN}clean${RESET}                  — Remove all keys and token"
     echo ""
-    echo -e "${BRIGHT_WHITE}  EXAMPLES:${RESET}"
+    echo -e "${BRIGHT_WHITE}  FLOW:${RESET}"
     echo ""
-    echo -e "  ${DIM}ms gen_keys${RESET}"
-    echo -e "  ${DIM}ms register alice 123456${RESET}"
-    echo -e "  ${DIM}ms login alice 123456${RESET}"
-    echo -e "  ${DIM}ms send bob 'Hello, Bob!'${RESET}"
-    echo -e "  ${DIM}ms dialog bob${RESET}"
-    echo -e "  ${DIM}ms chat${RESET}"
+    echo -e "  ${DIM}1. ms gen_keys alice${RESET}"
+    echo -e "  ${DIM}2. ms register alice 123456${RESET}"
+    echo -e "  ${DIM}3. ms login alice 123456${RESET}"
+    echo -e "  ${DIM}4. ms send bob 'Hello!'${RESET}"
+    echo -e "  ${DIM}5. ms chat${RESET}"
     echo ""
 }
 
@@ -306,7 +379,7 @@ cmd_help() {
 # ========================================================================
 
 case "$1" in
-    gen_keys)   cmd_gen_keys ;;
+    gen_keys)   cmd_gen_keys "$2" ;;
     register)   cmd_register "$2" "$3" ;;
     login)      cmd_login "$2" "$3" ;;
     logout)     cmd_logout ;;
@@ -315,6 +388,7 @@ case "$1" in
     dialog)     cmd_dialog "$2" ;;
     chat)       cmd_chat ;;
     status)     cmd_status ;;
+    list_keys)  cmd_list_keys ;;
     clean)      cmd_clean ;;
     help|-h|--help) cmd_help ;;
     *)
